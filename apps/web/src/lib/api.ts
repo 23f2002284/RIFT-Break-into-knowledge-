@@ -9,9 +9,17 @@ export function getApiBase(): string {
     return process.env.NEXT_PUBLIC_API_URL;
   }
   if (typeof window !== "undefined") {
-    // In browser, route through Next.js proxy rewrite on same host/port.
-    // This eliminates mixed-content HTTPS blocks, CORS, and mobile firewall issues with port 8000.
-    return "";
+    // If accessed via HTTPS (e.g. production domain or dev:https), route via same-origin Next.js proxy
+    // to prevent browser Mixed-Content blocks
+    if (window.location.protocol === "https:") {
+      return "";
+    }
+    // Over HTTP (e.g. desktop localhost or LAN IP), connect directly to FastAPI port 8000.
+    // This avoids Next.js Turbopack dev-proxy socket hang up (ECONNRESET) errors when uvicorn reloads.
+    if (window.location.hostname) {
+      return `http://${window.location.hostname}:8000`;
+    }
+    return "http://localhost:8000";
   }
   return process.env.BACKEND_INTERNAL_URL || "http://127.0.0.1:8000";
 }
@@ -20,6 +28,34 @@ const API_BASE = {
   toString: () => getApiBase(),
   valueOf: () => getApiBase(),
 } as unknown as string;
+
+/**
+ * Robust fetch wrapper that automatically retries on transient socket hang-ups (ECONNRESET)
+ * and falls back between direct port 8000 and Next.js proxy if one is temporarily unreachable.
+ */
+async function fetchWithRetry(url: string | URL | Request, init?: RequestInit, retries = 2): Promise<Response> {
+  const urlStr = typeof url === "string" ? url : url.toString();
+  try {
+    const res = await fetch(url, init);
+    // If a dev proxy returns 502/503/504 during backend reload, retry briefly
+    if ((res.status === 502 || res.status === 503 || res.status === 504) && retries > 0) {
+      await new Promise((r) => setTimeout(r, 250));
+      return fetchWithRetry(url, init, retries - 1);
+    }
+    return res;
+  } catch (err: any) {
+    if (retries > 0) {
+      await new Promise((r) => setTimeout(r, 250));
+      // If direct connection to port 8000 failed, fall back to relative same-origin proxy
+      if (urlStr.startsWith("http") && urlStr.includes(":8000/api/")) {
+        const fallbackUrl = urlStr.replace(/^https?:\/\/[^/]+:8000/, "");
+        return fetchWithRetry(fallbackUrl, init, retries - 1);
+      }
+      return fetchWithRetry(url, init, retries - 1);
+    }
+    throw err;
+  }
+}
 
 /** Default owner ID for development — will be replaced by real auth. */
 const DEV_OWNER_ID = "rift_user_01";
@@ -75,7 +111,7 @@ export async function uploadPdf(
     formData.append("instruction", instruction.trim());
   }
 
-  const res = await fetch(`${API_BASE}/api/documents/upload`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents/upload`, {
     method: "POST",
     headers: getHeaders(ownerId),
     body: formData,
@@ -97,7 +133,7 @@ export async function uploadByAddress(
   instruction?: string,
   ownerId?: string
 ): Promise<UploadResponse> {
-  const res = await fetch(`${API_BASE}/api/documents/upload-by-address`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents/upload-by-address`, {
     method: "POST",
     headers: {
       ...getHeaders(ownerId),
@@ -130,7 +166,7 @@ export async function queryDocument(
   signal?: AbortSignal,
   chatHistory?: Array<{ role: string; content: string }>
 ): Promise<QueryResponse> {
-  const res = await fetch(`${API_BASE}/api/documents/${documentId}/query`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents/${documentId}/query`, {
     method: "POST",
     headers: {
       ...getHeaders(ownerId),
@@ -169,7 +205,7 @@ export async function transcribeAudio(audioBlob: Blob): Promise<string> {
   }
   formData.append("file", audioBlob, `audio.${ext}`);
 
-  const res = await fetch(`${API_BASE}/api/stt/transcribe`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/stt/transcribe`, {
     method: "POST",
     body: formData,
   });
@@ -190,7 +226,7 @@ export async function getDocumentChunks(
   documentId: string,
   ownerId?: string
 ): Promise<DocumentChunk[]> {
-  const res = await fetch(`${API_BASE}/api/documents/${documentId}/chunks`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents/${documentId}/chunks`, {
     method: "GET",
     headers: getHeaders(ownerId),
   });
@@ -209,7 +245,7 @@ export async function getDocumentChunks(
 export async function listDocuments(
   ownerId?: string
 ): Promise<Document[]> {
-  const res = await fetch(`${API_BASE}/api/documents`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents`, {
     method: "GET",
     headers: getHeaders(ownerId),
   });
@@ -229,7 +265,7 @@ export async function getDocument(
   documentId: string,
   ownerId?: string
 ): Promise<Document> {
-  const res = await fetch(`${API_BASE}/api/documents/${documentId}`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents/${documentId}`, {
     method: "GET",
     headers: getHeaders(ownerId),
   });
@@ -249,7 +285,7 @@ export async function deleteDocument(
   documentId: string,
   ownerId?: string
 ): Promise<DeleteResponse> {
-  const res = await fetch(`${API_BASE}/api/documents/${documentId}`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents/${documentId}`, {
     method: "DELETE",
     headers: getHeaders(ownerId),
   });
@@ -315,7 +351,7 @@ export async function generateScript(
   instruction?: string,
   contentFilter?: string
 ): Promise<ScriptResponseData> {
-  const res = await fetch(`${API_BASE}/api/documents/${documentId}/script`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents/${documentId}/script`, {
     method: "POST",
     headers: {
       ...getHeaders(ownerId),
@@ -347,7 +383,7 @@ export async function synthesizeElevenLabs(
   voiceId?: string,
   modelId?: string
 ): Promise<ElevenLabsTTSResponse> {
-  const res = await fetch(`${API_BASE}/api/tts/eleven`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/tts/eleven`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -375,7 +411,7 @@ export async function synthesizeElevenLabs(
  * List available ElevenLabs voices.
  */
 export async function getElevenLabsVoices(): Promise<VoiceOption[]> {
-  const res = await fetch(`${API_BASE}/api/tts/voices`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/tts/voices`, {
     method: "GET",
   });
 
@@ -480,7 +516,7 @@ export async function listConversations(
   documentId: string,
   ownerId?: string
 ): Promise<ConversationItem[]> {
-  const res = await fetch(`${API_BASE}/api/documents/${documentId}/conversations`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents/${documentId}/conversations`, {
     method: "GET",
     headers: getHeaders(ownerId),
   });
@@ -494,7 +530,7 @@ export async function createConversation(
   systemPrompt?: string,
   ownerId?: string
 ): Promise<ConversationItem> {
-  const res = await fetch(`${API_BASE}/api/documents/${documentId}/conversations`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/documents/${documentId}/conversations`, {
     method: "POST",
     headers: {
       ...getHeaders(ownerId),
@@ -516,7 +552,7 @@ export async function getConversation(
   conversationId: string,
   ownerId?: string
 ): Promise<ConversationDetailResponse | null> {
-  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/conversations/${conversationId}`, {
     method: "GET",
     headers: getHeaders(ownerId),
   });
@@ -529,7 +565,7 @@ export async function updateConversation(
   data: { title?: string; system_prompt?: string },
   ownerId?: string
 ): Promise<ConversationItem> {
-  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/conversations/${conversationId}`, {
     method: "PATCH",
     headers: {
       ...getHeaders(ownerId),
@@ -548,7 +584,7 @@ export async function deleteConversation(
   conversationId: string,
   ownerId?: string
 ): Promise<boolean> {
-  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/conversations/${conversationId}`, {
     method: "DELETE",
     headers: getHeaders(ownerId),
   });
@@ -564,7 +600,7 @@ export async function queryConversation(
   ownerId?: string,
   instruction?: string
 ): Promise<{ user_message: ChatMessageItem; assistant_message: ChatMessageItem }> {
-  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/query`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/conversations/${conversationId}/query`, {
     method: "POST",
     headers: {
       ...getHeaders(ownerId),
@@ -595,7 +631,7 @@ export async function editConversationMessage(
   ownerId?: string,
   instruction?: string
 ): Promise<{ user_message: ChatMessageItem; assistant_message: ChatMessageItem }> {
-  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages/${messageId}`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/conversations/${conversationId}/messages/${messageId}`, {
     method: "PUT",
     headers: {
       ...getHeaders(ownerId),
@@ -624,7 +660,7 @@ export async function retryConversationMessage(
   ownerId?: string,
   instruction?: string
 ): Promise<ChatMessageItem> {
-  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages/${messageId}/retry`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/conversations/${conversationId}/messages/${messageId}/retry`, {
     method: "POST",
     headers: {
       ...getHeaders(ownerId),
@@ -649,7 +685,7 @@ export async function deleteConversationMessage(
   messageId: string,
   ownerId?: string
 ): Promise<{ ok: boolean; status: number; deletedCount?: number }> {
-  const res = await fetch(`${API_BASE}/api/conversations/${conversationId}/messages/${messageId}`, {
+  const res = await fetchWithRetry(`${API_BASE}/api/conversations/${conversationId}/messages/${messageId}`, {
     method: "DELETE",
     headers: getHeaders(ownerId),
   });

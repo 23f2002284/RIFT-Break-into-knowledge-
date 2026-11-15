@@ -1867,17 +1867,31 @@ export default function RAGPanel({
     [activeDocId, activeThreadId, addMessage, updateMessage, dictateAnswer, navigateToParagraph, stopAllDictationPlayback, paragraphs, pdfUrl, activeChatReference, setActiveChatReference]
   );
 
-  /* ── Speech Recognition & Real-Time Listening Setup ────────────────────── */
-  // Accumulates ALL finalized speech segments across the listening session so
-  // the full utterance (not just the last chunk) is auto-submitted on silence.
+  /* ── Stable Ref for Submit to Prevent Speech Recognition Restarts ──────── */
+  const submitQuestionRef = useRef(submitQuestion);
+  useEffect(() => {
+    submitQuestionRef.current = submitQuestion;
+  }, [submitQuestion]);
+
+  /* ── Continuous Listening Mode Controller (Web Speech API) ─────────────── */
   const listeningAccumulatedRef = useRef<string>("");
 
-  useEffect(() => {
+  const startContinuousListening = useCallback(() => {
     if (typeof window === "undefined") return;
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRec) return;
+    if (!SpeechRec) {
+      setVoiceNotice("Continuous voice mode requires Chrome or Edge (Web Speech API).");
+      return;
+    }
+
+    if (recognitionRef.current) {
+      try {
+        recognitionRef.current.abort();
+      } catch {}
+      recognitionRef.current = null;
+    }
 
     const langMap: Record<string, string> = {
       en: "en-US",
@@ -1893,7 +1907,6 @@ export default function RAGPanel({
     rec.interimResults = true;
     rec.lang = langMap[selectedLang] || "en-US";
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     rec.onresult = (e: any) => {
       let newFinal = "";
       let interim = "";
@@ -1912,8 +1925,7 @@ export default function RAGPanel({
       const spokenChunk = (newFinal || interim).trim();
       if (!spokenChunk) return;
 
-      // 1. ACOUSTIC ECHO REJECTION & INTELLIGENT BARGE-IN
-      // If RIFT is vocalizing out of the laptop speakers:
+      // 1. Acoustic Echo Rejection & Barge-in
       const isSpeakingNow = Boolean(
         dictatingMsgIdRef.current ||
         (typeof window !== "undefined" && window.speechSynthesis?.speaking)
@@ -1922,8 +1934,6 @@ export default function RAGPanel({
       if (isSpeakingNow) {
         const activeText = (activeDictatingTextRef.current || "").toLowerCase();
         const incomingWords = spokenChunk.toLowerCase().split(/\s+/).filter(Boolean);
-
-        // Check for explicit interrupt keywords
         const interruptKeywords = new Set([
           "stop", "wait", "hold", "pause", "quiet", "listen", "no", "cancel", "shh", "enough"
         ]);
@@ -1931,19 +1941,14 @@ export default function RAGPanel({
           interruptKeywords.has(w.replace(/[^a-z]/g, ""))
         );
 
-        // Acoustic Echo Detection:
-        // Does the incoming spoken chunk match what the AI is currently reading aloud?
         const cleanSpokenWords = incomingWords.map((w) => w.replace(/[^a-z0-9]/g, "")).filter(Boolean);
         let isEcho = false;
-
         if (!hasInterruptKeyword && cleanSpokenWords.length > 0) {
           const spokenPhrase = cleanSpokenWords.join(" ");
           const normalizedActive = activeText.replace(/[^a-z0-9\s]/g, " ").replace(/\s+/g, " ");
-
           if (normalizedActive.includes(spokenPhrase)) {
             isEcho = true;
           } else {
-            // Check word overlap ratio
             const matchedCount = cleanSpokenWords.filter((w) => w.length > 2 && normalizedActive.includes(w)).length;
             if (matchedCount / cleanSpokenWords.length >= 0.75) {
               isEcho = true;
@@ -1951,42 +1956,28 @@ export default function RAGPanel({
           }
         }
 
-        if (isEcho) {
-          // Discard speaker audio feedback loop; continue reading smoothly
-          return;
-        }
+        if (isEcho) return;
 
-        // Distinct user speech or interrupt command detected: BARGE-IN!
+        // Distinct user speech: Barge-in!
         stopAllDictationPlayback(true);
-
-        // If the user spoke a short interrupt command (e.g. "stop", "wait"), halt and wait for next question
         if (hasInterruptKeyword && cleanSpokenWords.length <= 2) {
           listeningAccumulatedRef.current = "";
           setVoiceTranscript("");
           setInput("");
           return;
         }
-
-        // Otherwise, user is asking a new question! Reset for new question
         listeningAccumulatedRef.current = "";
         setLastVoiceAiAnswer({ text: "", citations: [] });
       }
 
-      // 2. Ignore phantom echoes or tail results within 450ms of vocalization ending or submitting
       if (
         Date.now() - lastVocalizeEndTimeRef.current < 450 ||
-        Date.now() - lastSubmitTimeRef.current < 450
+        Date.now() - lastSubmitTimeRef.current < 450 ||
+        isSubmittingRef.current
       ) {
         return;
       }
 
-      // 3. SHIELD IN-FLIGHT QUERY:
-      // While RIFT is reasoning/synthesizing, do NOT allow microphone audio to override or abort the query!
-      if (isSubmittingRef.current) {
-        return;
-      }
-
-      // When user starts speaking a new query, clear previous query/answer from voice HUD so it starts fresh!
       if (lastVoiceAiAnswer.text) {
         setLastVoiceAiAnswer({ text: "", citations: [] });
       }
@@ -1994,13 +1985,11 @@ export default function RAGPanel({
         setLastUserSpeech("");
       }
 
-      // Append only genuinely new finalized words to accumulator
       if (newFinal) {
         listeningAccumulatedRef.current +=
           (listeningAccumulatedRef.current ? " " : "") + newFinal;
       }
 
-      // Display = everything accumulated so far + live interim preview
       const accumulated = listeningAccumulatedRef.current;
       const displayText = (
         accumulated + (interim ? (accumulated ? " " : "") + interim : "")
@@ -2010,7 +1999,6 @@ export default function RAGPanel({
         setVoiceTranscript(displayText);
         setInput(displayText);
 
-        // Smart Adaptive Patience: wait dynamically depending on grammar/connectors
         if (isListeningModeActiveRef.current) {
           if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
           const delayMs = computeSilenceDelay(displayText);
@@ -2020,7 +2008,6 @@ export default function RAGPanel({
             const textToSubmit = (listeningAccumulatedRef.current || displayText).trim();
             if (!textToSubmit) return;
 
-            // Filter out lone filler noises
             const words = textToSubmit.toLowerCase().split(/\s+/).filter(Boolean);
             const fillerWords = new Set(["um", "uh", "ah", "hmm", "okay", "yeah", "yes", "hey", "hello", "hi", "so"]);
             if (words.length === 1 && fillerWords.has(words[0].replace(/[^a-z]/g, ""))) {
@@ -2030,95 +2017,86 @@ export default function RAGPanel({
               return;
             }
 
-            // Reset accumulator before submitting so the next utterance starts fresh
             listeningAccumulatedRef.current = "";
             setLastUserSpeech(textToSubmit);
             setVoiceTranscript("");
             setInput("");
-            submitQuestion(textToSubmit);
+            submitQuestionRef.current(textToSubmit);
           }, delayMs);
         }
       }
     };
 
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     rec.onerror = (e: any) => {
       const errType = e?.error;
-      // Normal speech pauses must not cancel listening mode
-      if (errType === "no-speech" || errType === "aborted") {
-        return;
-      }
+      if (errType === "no-speech" || errType === "aborted") return;
       if (errType === "network") {
-        // Browser cloud STT blocked (Brave, mobile Chrome, VPN, ad-blocker) — show notice
-        setVoiceNotice("Mobile browser cloud STT offline. Tap the mic button in the message bar to speak with Gemini Flash AI!");
+        setVoiceNotice("Mobile browser cloud STT offline. Tap the mic button in the message bar to speak.");
       } else if (errType === "not-allowed") {
-        setVoiceError("Microphone permission denied. Please allow microphone access.");
+        setVoiceError("Microphone permission denied. Tap to allow in browser.");
+        setListeningMode(false);
+        isListeningModeActiveRef.current = false;
+        setShowPermissionModal(true);
       } else {
         console.warn("SpeechRec error:", errType);
       }
     };
 
     rec.onend = () => {
-      if (isListeningModeActiveRef.current) {
-        // If user stopped talking and has accumulated text, trigger submit promptly
-        const pending = listeningAccumulatedRef.current.trim();
-        if (pending && !isSubmittingRef.current && !dictatingMsgIdRef.current) {
-          const hasRealWords = pending.split(/\s+/).some((w) => w.replace(/[^a-zA-Z0-9]/g, "").length >= 2);
-          if (hasRealWords) {
-            if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
-            silenceTimerRef.current = setTimeout(() => {
-              if (isSubmittingRef.current) return;
-              const textToSubmit = listeningAccumulatedRef.current.trim();
-              if (textToSubmit) {
-                listeningAccumulatedRef.current = "";
-                setLastUserSpeech(textToSubmit);
-                setVoiceTranscript("");
-                setInput("");
-                submitQuestion(textToSubmit);
-              }
-            }, 350);
-          }
-        }
+      if (!isListeningModeActiveRef.current) return;
 
-        // Debounced restart keeps continuous listening active (to support barge-in)
-        if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
-        restartTimerRef.current = setTimeout(() => {
-          if (isListeningModeActiveRef.current) {
-            try {
-              rec.start();
-            } catch (err) {
-              console.warn("SpeechRec restart error:", err);
+      const pending = listeningAccumulatedRef.current.trim();
+      if (pending && !isSubmittingRef.current && !dictatingMsgIdRef.current) {
+        const hasRealWords = pending.split(/\s+/).some((w) => w.replace(/[^a-zA-Z0-9]/g, "").length >= 2);
+        if (hasRealWords) {
+          if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
+          silenceTimerRef.current = setTimeout(() => {
+            if (isSubmittingRef.current) return;
+            const textToSubmit = listeningAccumulatedRef.current.trim();
+            if (textToSubmit) {
+              listeningAccumulatedRef.current = "";
+              setLastUserSpeech(textToSubmit);
+              setVoiceTranscript("");
+              setInput("");
+              submitQuestionRef.current(textToSubmit);
             }
-          }
-        }, 120);
+          }, 350);
+        }
       }
+
+      // Automatically spawn a fresh instance to keep continuous listening alive without InvalidStateError
+      if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
+      restartTimerRef.current = setTimeout(() => {
+        if (isListeningModeActiveRef.current) {
+          startContinuousListening();
+        }
+      }, 120);
     };
 
     recognitionRef.current = rec;
-
-    return () => {
-      try {
-        rec.abort();
-      } catch {}
-      if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
-    };
-  }, [submitQuestion, selectedLang]);
+    try {
+      rec.start();
+    } catch (err) {
+      console.warn("SpeechRec start error:", err);
+    }
+  }, [selectedLang, stopAllDictationPlayback]);
 
   // Toggle Listening Mode (continuous listening & auto-send)
-  const toggleListeningMode = useCallback(async () => {
+  const toggleListeningMode = useCallback(() => {
     // If voice typing is currently active, stop it before turning on continuous mode
     if (isVoiceTyping) {
       if (voiceRecRef.current) {
         try {
           voiceRecRef.current.abort();
         } catch {}
+        voiceRecRef.current = null;
       }
       setIsVoiceTyping(false);
+      isVoiceTypingRef.current = false;
       setInterimTranscript("");
     }
 
     if (!listeningMode) {
-      // 1. Wipe all previous voice buffers & state so listening mode starts 100% clean
       listeningAccumulatedRef.current = "";
       setVoiceTranscript("");
       setLastUserSpeech("");
@@ -2138,32 +2116,18 @@ export default function RAGPanel({
       setVoiceNotice(null);
       setVoiceError(null);
 
-      // Verify microphone access FIRST before activating listening mode
-      const stream = await getCleanMicStream();
-      if (!stream) {
-        // getCleanMicStream already flagged insecure context or denied permission
-        return;
-      }
-
       setListeningMode(true);
       isListeningModeActiveRef.current = true;
-      setActiveMicStream(stream);
-
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.start();
-        } catch (err) {
-          console.warn("SpeechRec start error:", err);
-        }
-      } else {
-        setVoiceNotice("Continuous mode is not supported on this mobile browser. Tap the mic icon below to voice type with Gemini Flash AI!");
-      }
+      startContinuousListening();
     } else {
       setListeningMode(false);
       isListeningModeActiveRef.current = false;
-      try {
-        recognitionRef.current?.abort();
-      } catch {}
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch {}
+        recognitionRef.current = null;
+      }
       if (silenceTimerRef.current) clearTimeout(silenceTimerRef.current);
       if (restartTimerRef.current) clearTimeout(restartTimerRef.current);
       listeningAccumulatedRef.current = "";
@@ -2172,27 +2136,11 @@ export default function RAGPanel({
       activeDictatingTextRef.current = "";
       setVoiceNotice(null);
       setVoiceError(null);
-      if (micStreamRef.current) {
-        micStreamRef.current.getTracks().forEach((t) => t.stop());
-        micStreamRef.current = null;
-      }
-      setActiveMicStream(null);
     }
-  }, [isVoiceTyping, listeningMode, getCleanMicStream]);
+  }, [isVoiceTyping, listeningMode, startContinuousListening]);
 
   /* ── Dedicated Voice Input Typing (Web Speech API + Backend Gemini Flash STT) ── */
   const stopVoiceTyping = useCallback(async () => {
-    if (voiceTypingSilenceTimerRef.current) {
-      clearTimeout(voiceTypingSilenceTimerRef.current);
-      voiceTypingSilenceTimerRef.current = null;
-    }
-    if (voiceTypingAudioCtxRef.current) {
-      try {
-        voiceTypingAudioCtxRef.current.close();
-      } catch {}
-      voiceTypingAudioCtxRef.current = null;
-    }
-
     setIsVoiceTyping(false);
     isVoiceTypingRef.current = false;
     setInterimTranscript("");
@@ -2204,50 +2152,41 @@ export default function RAGPanel({
       voiceRecRef.current = null;
     }
 
-    // If Web Speech API already transcribed speech, we are done!
-    if (hasWebSpeechProducedTextRef.current) {
-      setVoiceNotice("Transcribed!");
-      setTimeout(() => setVoiceNotice(null), 2000);
-      setTimeout(() => {
-        if (inputRef.current) {
-          inputRef.current.focus();
-          const len = inputRef.current.value.length;
-          inputRef.current.setSelectionRange(len, len);
+    // If MediaRecorder fallback was used (e.g. mobile or network error):
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+      setIsTranscribing(true);
+      setVoiceNotice("Transcribing with Gemini Flash AI…");
+      try {
+        const text = await stopMediaRecordingAndTranscribe();
+        if (text && text.trim()) {
+          const base = baseTextRef.current;
+          const fullText = base ? `${base} ${text.trim()}` : text.trim();
+          setInput(fullText);
+          setVoiceTranscript(text.trim());
+          setVoiceNotice("Transcribed!");
+          setTimeout(() => setVoiceNotice(null), 2500);
+        } else {
+          setVoiceNotice(null);
         }
-      }, 60);
-      return;
+      } catch (err: any) {
+        console.warn("Backend STT error:", err);
+        setVoiceError(err?.message || "Audio transcription failed.");
+        setVoiceNotice(null);
+      } finally {
+        setIsTranscribing(false);
+      }
+    } else {
+      setVoiceNotice("Transcribed!");
+      setTimeout(() => setVoiceNotice(null), 1500);
     }
 
-    // If Web Speech API gave a 'network' error or produced no text:
-    // Transcribe with the Gemini Flash AI backend STT!
-    setIsTranscribing(true);
-    setVoiceNotice("Transcribing with Gemini Flash AI…");
-    try {
-      const text = await stopMediaRecordingAndTranscribe();
-      if (text && text.trim()) {
-        const base = baseTextRef.current;
-        const fullText = base ? `${base} ${text.trim()}` : text.trim();
-        setInput(fullText);
-        setVoiceTranscript(text.trim());
-        setVoiceNotice("Transcribed!");
-        setTimeout(() => setVoiceNotice(null), 2500);
-      } else {
-        setVoiceNotice(null);
+    setTimeout(() => {
+      if (inputRef.current) {
+        inputRef.current.focus();
+        const len = inputRef.current.value.length;
+        inputRef.current.setSelectionRange(len, len);
       }
-    } catch (err: any) {
-      console.warn("Backend STT transcription error:", err);
-      setVoiceError(err?.message || "Audio transcription failed. Please try again.");
-      setVoiceNotice(null);
-    } finally {
-      setIsTranscribing(false);
-      setTimeout(() => {
-        if (inputRef.current) {
-          inputRef.current.focus();
-          const len = inputRef.current.value.length;
-          inputRef.current.setSelectionRange(len, len);
-        }
-      }, 60);
-    }
+    }, 60);
   }, [stopMediaRecordingAndTranscribe]);
 
   stopVoiceTypingRef.current = stopVoiceTyping;
@@ -2255,31 +2194,24 @@ export default function RAGPanel({
   const startVoiceTyping = useCallback(async () => {
     if (typeof window === "undefined") return;
 
-    // Stop continuous listening mode if it was active
+    // Stop continuous listening mode if active
     if (listeningMode) {
       setListeningMode(false);
       isListeningModeActiveRef.current = false;
-      try {
-        recognitionRef.current?.abort();
-      } catch {}
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
+        } catch {}
+        recognitionRef.current = null;
+      }
     }
 
-    // Abort previous voice typing session if any
+    // Abort prior voice typing session
     if (voiceRecRef.current) {
       try {
         voiceRecRef.current.abort();
       } catch {}
       voiceRecRef.current = null;
-    }
-    if (voiceTypingSilenceTimerRef.current) {
-      clearTimeout(voiceTypingSilenceTimerRef.current);
-      voiceTypingSilenceTimerRef.current = null;
-    }
-    if (voiceTypingAudioCtxRef.current) {
-      try {
-        voiceTypingAudioCtxRef.current.close();
-      } catch {}
-      voiceTypingAudioCtxRef.current = null;
     }
 
     setVoiceError(null);
@@ -2288,86 +2220,13 @@ export default function RAGPanel({
     hasWebSpeechProducedTextRef.current = false;
     baseTextRef.current = input.trim();
 
-    // 1. Immediately request / acquire microphone audio stream
-    // This MUST run directly inside the user's tap gesture so the browser can prompt for permission!
-    const stream = await getCleanMicStream();
-    if (!stream) {
-      return;
-    }
+    // Check if Web Speech API is supported
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const SpeechRec = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
 
-    await startMediaRecording();
-    setIsVoiceTyping(true);
-    isVoiceTypingRef.current = true;
-
-    // 2. Attach Web Audio VAD for automated silence detection on mobile
-    try {
-      const AudioCtxClass = window.AudioContext || (window as any).webkitAudioContext;
-      if (AudioCtxClass) {
-        const audioCtx = new AudioCtxClass();
-        if (audioCtx.state === "suspended") {
-          audioCtx.resume();
-        }
-        voiceTypingAudioCtxRef.current = audioCtx;
-        const source = audioCtx.createMediaStreamSource(stream);
-        const analyser = audioCtx.createAnalyser();
-        analyser.fftSize = 512;
-        analyser.smoothingTimeConstant = 0.3;
-        source.connect(analyser);
-
-        const dataArray = new Uint8Array(analyser.frequencyBinCount);
-        let speechDetected = false;
-        let silenceStartTime: number | null = null;
-        const sessionStartTime = Date.now();
-
-        const checkAudioEnergy = () => {
-          if (!isVoiceTypingRef.current) return;
-          analyser.getByteFrequencyData(dataArray);
-
-          // Calculate average audio frequency energy
-          let sum = 0;
-          for (let i = 0; i < dataArray.length; i++) {
-            sum += dataArray[i];
-          }
-          const avgEnergy = sum / dataArray.length;
-
-          // Energy threshold for active human voice
-          if (avgEnergy > 14) {
-            speechDetected = true;
-            silenceStartTime = null;
-          } else if (speechDetected) {
-            // Speech was detected previously; now we have a pause/silence
-            if (silenceStartTime === null) {
-              silenceStartTime = Date.now();
-            } else if (Date.now() - silenceStartTime > 1700) {
-              // 1.7 seconds of continuous silence after speech: AUTO-STOP & TRANSCRIBE!
-              stopVoiceTypingRef.current();
-              return;
-            }
-          }
-
-          // Safety ceiling: auto-stop after 25s continuous recording
-          if (Date.now() - sessionStartTime > 25000) {
-            stopVoiceTypingRef.current();
-            return;
-          }
-
-          voiceTypingSilenceTimerRef.current = setTimeout(checkAudioEnergy, 100);
-        };
-
-        voiceTypingSilenceTimerRef.current = setTimeout(checkAudioEnergy, 250);
-      }
-    } catch (vadErr) {
-      console.warn("Web Audio VAD initialization error:", vadErr);
-    }
-
-    // 3. Concurrently attempt browser Web Speech API for real-time live typing
-    const SpeechRecognition =
-      (window as any).SpeechRecognition ||
-      (window as any).webkitSpeechRecognition;
-
-    if (SpeechRecognition) {
+    if (SpeechRec) {
       try {
-        const rec = new SpeechRecognition();
+        const rec = new SpeechRec();
         rec.continuous = true;
         rec.interimResults = true;
 
@@ -2384,6 +2243,7 @@ export default function RAGPanel({
         rec.onstart = () => {
           setIsVoiceTyping(true);
           isVoiceTypingRef.current = true;
+          setVoiceNotice(null);
         };
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -2403,7 +2263,6 @@ export default function RAGPanel({
           }
 
           setInterimTranscript(interimTrans);
-
           const currentSpoken = (finalTrans + (interimTrans ? (finalTrans ? " " : "") + interimTrans : "")).trim();
           if (currentSpoken) {
             hasWebSpeechProducedTextRef.current = true;
@@ -2415,15 +2274,21 @@ export default function RAGPanel({
         };
 
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        rec.onerror = (event: any) => {
+        rec.onerror = async (event: any) => {
           const errType = event?.error;
           if (errType === "no-speech" || errType === "aborted") return;
 
           if (errType === "network") {
-            // Browser cloud speech service unreachable (Brave Shield, VPN, ad blocker)
-            // DO NOT stop recording! Local MediaRecorder is actively recording audio for backend Gemini STT!
-            setVoiceNotice("Listening… (Gemini Flash AI STT)");
-            console.warn("Web Speech API network error: will transcribe with Gemini Flash backend STT.");
+            // Browser cloud STT offline on mobile/firewall: fallback to MediaRecorder + Gemini Flash!
+            console.warn("Web Speech API network error: switching to Gemini Flash STT fallback.");
+            setVoiceNotice("Recording with Gemini Flash AI… tap mic when done.");
+            try {
+              rec.abort();
+            } catch {}
+            voiceRecRef.current = null;
+            await startMediaRecording();
+            setIsVoiceTyping(true);
+            isVoiceTypingRef.current = true;
           } else if (errType === "not-allowed") {
             setMicPermissionState("denied");
             setVoiceError("Microphone permission denied. Tap to allow in browser.");
@@ -2431,24 +2296,30 @@ export default function RAGPanel({
             isVoiceTypingRef.current = false;
             setShowPermissionModal(true);
           } else {
-            setVoiceNotice(`Using backend AI STT (${errType})`);
+            console.warn("SpeechRec error:", errType);
           }
         };
 
         rec.onend = () => {
-          // If Web Speech API ends naturally, don't kill voice typing if user is still speaking
+          // If stopped naturally or by user, state is updated
         };
 
         voiceRecRef.current = rec;
         rec.start();
-      } catch (err: any) {
-        console.warn("Web Speech start error; using backend STT:", err);
-        setVoiceNotice("Listening… (Gemini Flash AI STT)");
+        setIsVoiceTyping(true);
+        isVoiceTypingRef.current = true;
+        return;
+      } catch (err) {
+        console.warn("Web Speech start failed, falling back to MediaRecorder:", err);
       }
-    } else {
-      setVoiceNotice("Listening… (Gemini Flash AI STT)");
     }
-  }, [input, selectedLang, listeningMode, startMediaRecording, getCleanMicStream]);
+
+    // Fallback if SpeechRecognition doesn't exist in browser:
+    setVoiceNotice("Recording with Gemini Flash AI… tap mic when done.");
+    await startMediaRecording();
+    setIsVoiceTyping(true);
+    isVoiceTypingRef.current = true;
+  }, [input, selectedLang, listeningMode, startMediaRecording]);
 
   const toggleVoiceTyping = useCallback(() => {
     if (isVoiceTyping) {
@@ -2464,6 +2335,11 @@ export default function RAGPanel({
       if (voiceRecRef.current) {
         try {
           voiceRecRef.current.abort();
+        } catch {}
+      }
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.abort();
         } catch {}
       }
     };

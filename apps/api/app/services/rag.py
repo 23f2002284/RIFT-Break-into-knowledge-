@@ -126,15 +126,18 @@ def build_rag_prompts(
         "  * Use compact Markdown tables only for true multi-item comparisons; never emit deeply nested trees, raw HTML tags, ASCII art, emoji clusters, or pasted raw URLs (rely on inline `[N]` citations for web sources).\n"
         "  * Write complete, natural phrasing in headings and list items so spoken narration flows cleanly between points.\n"
         "- Consider recent conversation history for follow-ups and pronoun continuity.\n\n"
-        "5. MATHEMATICAL & SCIENTIFIC NOTATION:\n"
-        "- When the source contains mathematical expressions, output them using standard LaTeX notation: "
-        "inline math with `$...$` and display/block math with `$$...$$`.\n"
-        "- Chemical formulas should use LaTeX subscript notation: write H₂O as `$H_2O$`, CO₂ as `$CO_2$`, etc.\n"
-        "- Greek letters in scientific contexts should use LaTeX: `$\\alpha$`, `$\\beta$`, `$\\pi$`, etc.\n"
-        "- For complex equations (fractions, integrals, matrices), use proper LaTeX commands: "
-        "`\\frac{}{}`, `\\int`, `\\sum`, `\\sqrt{}`, etc.\n"
-        "- Keep surrounding text natural and readable — the LaTeX is for visual rendering, "
-        "while the surrounding words should make the meaning clear when read aloud.\n\n"
+        "5. MATHEMATICAL & SCIENTIFIC NOTATION (EQUATIONS & SPOKEN DICTATION):\n"
+        "- Identify all mathematical expressions, variables, formulas, and scientific notations and output them in standard LaTeX accompanied IMMEDIATELY by their natural spoken pronunciations in parentheses:\n"
+        "  * Inline variables & expressions: '$H_{static}$ (H static)', '$H(k, t)$ (H of k and t)', '$z_{dynamic}$ (z dynamic)', '$L_{ortho}$ (L ortho)', '$x_1$ (x 1)', '$E = mc^2$ (E equals m c squared)'.\n"
+        "  * Display / block math formulas: '$$E = mc^2$$ (E equals m c squared)', '$$\\frac{-b \\pm \\sqrt{b^2 - 4ac}}{2a}$$ (negative b plus or minus square root of b squared minus 4 a c, all over 2 a)', '$$\\int_0^\\infty f(x) dx$$ (integral from 0 to infinity of f of x d x)'.\n"
+        "  * Chemical formulas: write H2O as '$H_2O$ (H 2 O)', CO2 as '$CO_2$ (C O 2)', NaCl as '$NaCl$ (N a C l)'.\n"
+        "  * Greek letters in scientific contexts: write '$\\alpha$ (alpha)', '$\\beta$ (beta)', '$\\pi$ (pi)', '$\\sigma$ (sigma)'.\n"
+        "- CRITICAL RULE: The spoken pronunciation in parentheses MUST appear immediately after the closing '$' or '$$' (e.g. '$...$ (spoken words)' or '$$...$$ (spoken words)'). "
+        "The RIFT interface parses this to render the clean visual KaTeX formula on screen while completely hiding the parenthetical text, "
+        "and when the user listens to or dictates the response, voice playback speaks the natural pronunciation while highlighting the equation on screen.\n"
+        "- Place source citations [N] after the pronunciation parentheses (e.g. '$$E = mc^2$$ (E equals m c squared) [1]' or '$H_{static}$ (H static) [2]').\n"
+        "- NEVER output raw unformatted squashed variable names (e.g. write '$H_{static}$ (H static)', NEVER 'Hstatic').\n"
+        "- Cleanly omit visual PDF diagram artifacts such as overbrace and underbrace characters (⏞, ⏟) and instead explain the equation naturally.\n\n"
         "6. FIGURES, DIAGRAMS & VISUAL CONTENT:\n"
         "- Sources labeled as `Figure` or `Figure / Diagram` contain multimodal descriptions, OCR text labels, and visual captions of diagrams, graphs, flowcharts, architectures, and images in the PDF.\n"
         "- When answering questions about visual elements, figures, diagrams, flowcharts, system architectures, or plots, explain them clearly using the extracted visual labels and captions.\n"
@@ -226,7 +229,7 @@ def _build_tavily_tool() -> types.Tool:
 
 
 _PROTECTED_MD_SEGMENT_RE = re.compile(
-    r"(```[\s\S]*?```|`[^`\n]+`|!?\[[^\]]*\]\([^)]+\))"
+    r"(```[\s\S]*?```|`[^`\n]+`|\$\$[\s\S]*?\$\$|\$(?:[^$\\]|\\.)+\$|!?\[[^\]]*\]\([^)]+\))"
 )
 _NUMERIC_BRACKET_RE = re.compile(r"\[(\s*\d+(?:\s*,\s*\d+)*\s*)\]")
 

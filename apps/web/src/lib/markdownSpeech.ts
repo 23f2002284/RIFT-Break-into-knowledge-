@@ -90,9 +90,9 @@ export function parseInlineMarkdown(text: string): MarkdownInlineNode[] {
         const mathContent = text.slice(idx + 2, end);
         let nextIdx = end + 2;
         let spokenText: string | undefined = undefined;
-        const pronMatch = /^\s*(?:\(([^)\r\n]+)\)|\[([^\]\r\n]+)\])/.exec(text.slice(nextIdx));
+        const pronMatch = /^\s*(?:\(([^)]+)\)|\[([^\]]+)\])/.exec(text.slice(nextIdx));
         if (pronMatch) {
-          const inner = (pronMatch[1] || pronMatch[2] || "").trim();
+          const inner = (pronMatch[1] || pronMatch[2] || "").replace(/\s+/g, " ").trim();
           if (isLikelyPronunciation(inner)) {
             spokenText = inner;
             nextIdx += pronMatch[0].length;
@@ -113,9 +113,9 @@ export function parseInlineMarkdown(text: string): MarkdownInlineNode[] {
         if (content.trim() && !/^\d/.test(content.trim())) {
           let nextIdx = end + 1;
           let spokenText: string | undefined = undefined;
-          const pronMatch = /^\s*(?:\(([^)\r\n]+)\)|\[([^\]\r\n]+)\])/.exec(text.slice(nextIdx));
+          const pronMatch = /^\s*(?:\(([^)]+)\)|\[([^\]]+)\])/.exec(text.slice(nextIdx));
           if (pronMatch) {
-            const inner = (pronMatch[1] || pronMatch[2] || "").trim();
+            const inner = (pronMatch[1] || pronMatch[2] || "").replace(/\s+/g, " ").trim();
             if (isLikelyPronunciation(inner)) {
               spokenText = inner;
               nextIdx += pronMatch[0].length;
@@ -539,9 +539,9 @@ export function parseMarkdownBlocks(raw: string): MarkdownBlockNode[] {
  * ElevenLabs AI Voice and Browser SpeechSynthesis, with natural pauses.
  */
 export function markdownToSpeechText(raw: string): string {
-  const preCleaned = replaceMathWithSpokenPronunciation(
-    cleanMathTextForSpokenTts(stripCitationMarkers(raw || ""))
-  );
+  const withoutCitations = stripCitationMarkers(raw || "");
+  const mathPronounced = replaceMathWithSpokenPronunciation(withoutCitations);
+  const preCleaned = cleanMathTextForSpokenTts(mathPronounced);
   if (!preCleaned.trim()) return "";
 
   const blocks = parseMarkdownBlocks(preCleaned);
@@ -921,7 +921,7 @@ export function replaceMathWithSpokenPronunciation(text: string): string {
 
   // 1. Display math: $$...$$\s*(...) or $$...$$\s*[...]
   s = s.replace(
-    /\$\$([\s\S]*?)\$\$\s*(?:\(([^)\r\n]+)\)|\[([^\]\r\n]+)\])/g,
+    /\$\$([\s\S]*?)\$\$\s*(?:\(([^)]+)\)|\[([^\]]+)\])/g,
     (full, _expr, parenInner, bracketInner) => {
       const inner = (parenInner || bracketInner || "").trim();
       if (isLikelyPronunciation(inner)) {
@@ -933,7 +933,7 @@ export function replaceMathWithSpokenPronunciation(text: string): string {
 
   // 2. Inline math: $...$\s*(...) or $...$\s*[...]
   s = s.replace(
-    /\$((?:[^$\\]|\\.)+?)\$\s*(?:\(([^)\r\n]+)\)|\[([^\]\r\n]+)\])/g,
+    /\$((?:[^$\\]|\\.)+?)\$\s*(?:\(([^)]+)\)|\[([^\]]+)\])/g,
     (full, _expr, parenInner, bracketInner) => {
       const inner = (parenInner || bracketInner || "").trim();
       if (isLikelyPronunciation(inner)) {
@@ -959,7 +959,7 @@ export function convertMathToSpokenText(text: string): string {
   // Display math blocks $$...$$ (for standalone equations without adjacent pronunciation)
   spoken = spoken.replace(/\$\$([\s\S]*?)\$\$/g, (_, expr) => mathExprToSpeech(expr));
   // Inline math $...$ (for standalone equations without adjacent pronunciation)
-  spoken = spoken.replace(/\$(.*?)\$/g, (_, expr) => mathExprToSpeech(expr));
+  spoken = spoken.replace(/\$((?:[^$\\]|\\.)+?)\$/g, (_, expr) => mathExprToSpeech(expr));
   // Clean any remaining bare LaTeX / mathcal commands outside $...$
   spoken = cleanMathTextForSpokenTts(spoken);
   return spoken.replace(/\s{2,}/g, " ").trim();
@@ -975,7 +975,7 @@ export function convertMathToSpokenTextKeepCues(text: string): string {
   // Display math blocks $$...$$ (for standalone equations without adjacent pronunciation)
   spoken = spoken.replace(/\$\$([\s\S]*?)\$\$/g, (_, expr) => mathExprToSpeech(expr));
   // Inline math $...$ (for standalone equations without adjacent pronunciation)
-  spoken = spoken.replace(/\$(.*?)\$/g, (_, expr) => mathExprToSpeech(expr));
+  spoken = spoken.replace(/\$((?:[^$\\]|\\.)+?)\$/g, (_, expr) => mathExprToSpeech(expr));
   // Clean any remaining bare LaTeX / mathcal commands outside $...$
   spoken = cleanMathTextForSpokenTts(spoken);
   return spoken.replace(/\s{2,}/g, " ").trim();

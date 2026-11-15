@@ -519,4 +519,12 @@ code, pre {
   }
 }
 
+/* ── Word Karaoke & KaTeX equation synchronized highlighting ── */
+[data-active-word="true"] .katex,
+[data-active-word="true"] .katex * {
+  color: #00f5d4 !important;
+  text-shadow: 0 0 12px rgba(0, 245, 212, 0.9) !important;
+}
+
+
 
